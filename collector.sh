@@ -13,19 +13,21 @@ collect_go() {
   k=$(jq -r '.["opencode-go"].key // empty' "$AUTH_JSON" 2>/dev/null) || true
   [[ -n $k ]] || { echo '{"status":"No API key"}'; return; }
   tmpf=$(mktemp) || { echo '{"status":"network error"}'; return; }
+  hdrf=$(mktemp) || { rm -f "$tmpf"; echo '{"status":"network error"}'; return; }
+  chmod 600 "$tmpf" "$hdrf" 2>/dev/null
+  trap 'rm -f "$tmpf" "$hdrf"' EXIT
+  printf 'Authorization: Bearer %s\n' "$k" >"$hdrf"
   set +o pipefail
-  curl -sS -m 10 -w $'\n%{http_code}' -H "Authorization: Bearer $k" "$GO_URL" 2>/dev/null \
+  curl -sS -m 10 -w $'\n%{http_code}' --header @"$hdrf" "$GO_URL" 2>/dev/null \
     | head -c $((GO_MAX_BYTES+1)) >"$tmpf"
   curl_stat=${PIPESTATUS[0]}
   set -o pipefail
   size=$(wc -c <"$tmpf")
   if (( size > GO_MAX_BYTES )); then
-    rm -f "$tmpf"
     echo '{"status":"response too large"}'
     return
   fi
   if [[ $curl_stat != 0 ]]; then
-    rm -f "$tmpf"
     echo '{"status":"network error"}'
     return
   fi
