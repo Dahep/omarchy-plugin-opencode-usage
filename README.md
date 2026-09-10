@@ -13,9 +13,18 @@ Clone the repository into your Omarchy plugin directory and enable it:
 
     omarchy plugin add https://github.com/Dahep/omarchy-plugin-opencode-usage
 
+The command validates the plugin, enables it, and asks which bar section to
+place the widget in (default: right). For a non-interactive install that
+enables the widget with the default section:
+
+    omarchy plugin add https://github.com/Dahep/omarchy-plugin-opencode-usage --enable --yes
+
 ## Remove
 
+Removes the plugin files and takes the bar widget with it:
+
     omarchy plugin remove io.github.dahep.opencode-usage
+
 
 ## Dependencies
 
