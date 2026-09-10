@@ -102,6 +102,6 @@ if [[ -r $DB ]]; then
      FROM message WHERE time_created > $CUTOFF GROUP BY 1 ORDER BY 1;" 2>/dev/null || true)
 fi
 
-jq -cn --argjson providers "$providers" --argjson go "$gojson" --argjson keys "$keys_json" \
+jq -cn --argjson providers "$providers" --argjson go "$gojson" \
   --argjson recentDays "$recent" \
-  '{status:"ok",providers:$providers,keys:$keys,go:$go,recentDays:$recentDays,updatedAt:(now|todateiso8601)}'
+  '{status:"ok",providers:$providers,go:$go,recentDays:$recentDays,updatedAt:(now|todateiso8601)}'
