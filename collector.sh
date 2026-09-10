@@ -6,11 +6,31 @@ DB="$HOME/.local/share/opencode/opencode.db"
 CUTOFF=$(( $(date +%s)*1000-604800000 ))
 MONTH_CUTOFF=$(( $(date +%s)*1000-30*86400000 ))
 
+GO_MAX_BYTES=262144
+
 collect_go() {
-  local k out code
+  local k out code size
   k=$(jq -r '.["opencode-go"].key // empty' "$AUTH_JSON" 2>/dev/null) || true
   [[ -n $k ]] || { echo '{"status":"No API key"}'; return; }
-  out=$(curl -sS -m 10 -w $'\n%{http_code}' -H "Authorization: Bearer $k" "$GO_URL" 2>/dev/null) || { echo '{"status":"network error"}'; return; }
+  tmpf=$(mktemp) || { echo '{"status":"network error"}'; return; }
+  set +o pipefail
+  curl -sS -m 10 -w $'\n%{http_code}' -H "Authorization: Bearer $k" "$GO_URL" 2>/dev/null \
+    | head -c $((GO_MAX_BYTES+1)) >"$tmpf"
+  curl_stat=${PIPESTATUS[0]}
+  set -o pipefail
+  size=$(wc -c <"$tmpf")
+  if (( size > GO_MAX_BYTES )); then
+    rm -f "$tmpf"
+    echo '{"status":"response too large"}'
+    return
+  fi
+  if [[ $curl_stat != 0 ]]; then
+    rm -f "$tmpf"
+    echo '{"status":"network error"}'
+    return
+  fi
+  out=$(<"$tmpf")
+  rm -f "$tmpf"
   code=${out##*$'\n'}; out=${out%$'\n'*}
   [[ $code == 200 ]] || { jq -cn --arg s "HTTP $code" '{status:$s}'; return; }
   jq -e '.usage.rolling and .usage.weekly and .usage.monthly' >/dev/null 2>&1 <<<"$out" || { echo '{"status":"bad response"}'; return; }
