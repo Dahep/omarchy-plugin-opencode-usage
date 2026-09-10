@@ -8,8 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "local.opencode-usage"
-  ipcTarget: "local.opencode-usage"
+  moduleName: "io.github.dahep.opencode-usage"
+  ipcTarget: "io.github.dahep.opencode-usage"
 
   property double nowMs: Date.now()
   property string expandedProviderId: ""
