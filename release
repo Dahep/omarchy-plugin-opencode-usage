@@ -137,7 +137,8 @@ get_version() {
 }
 
 fetch_origin_main() {
-  git fetch origin main --quiet 2>/dev/null || true
+  git fetch origin main --quiet 2>/dev/null || \
+    die "git fetch origin main failed" "check network/remote access, then re-run"
 }
 
 assert_on_main() {
@@ -156,17 +157,21 @@ assert_main_synced() {
     "git pull --ff-only, then re-run"
 }
 
-check_drift() {
-  # Warn (non-fatal for status) if origin/main moved past a pending verify SHA.
-  local expected="$1" current
+check_pending_verify_drift() {
+  # Fatal if any open [Verify] issue pins a SHA other than current origin/main:
+  # moving main while an update is pending makes its baseline stale.
+  local issues current
   fetch_origin_main
   current=$(git rev-parse origin/main)
-  if [ "$expected" != "$current" ]; then
-    echo "WARNING: verification SHA $expected != origin/main HEAD $current — baseline is stale." >&2
-    echo "  Open a fresh [Verify] issue for the new HEAD: $SCRIPT_NAME publish" >&2
-    echo "  or revalidate the open issue: $SCRIPT_NAME revalidate <issue>" >&2
-    return 1
-  fi
+  issues=$(find_verify_issue)
+  [ -n "$issues" ] || return 0
+  local num sha
+  while IFS=$'\t' read -r num sha; do
+    if [ "$sha" != "$current" ]; then
+      die "open [Verify] issue #$num pins $sha but origin/main is $current — baseline would go stale" \
+        "wait for approval/close of #$num, or revalidate it ($SCRIPT_NAME revalidate $num) before moving main"
+    fi
+  done <<<"$issues"
 }
 
 verify_issue_fields() {
@@ -191,22 +196,23 @@ verify_issue_fields() {
   echo "- [x] I understand that only the exact target commit can become a verified marketplace snapshot and that verification is not a security audit."
 }
 
-# Find the open [Verify] issue for this repo, if any. Echoes "issue|sha|state".
+# Find open [Verify] issues for this repo. Echoes "issue|sha" per match.
 find_verify_issue() {
-  gh issue list --repo "$MARKET_REPO" --search "in:title \"[Verify]:\" state:open author:@me" \
-    --json number,title,state --limit 20 2>/dev/null \
-    | jq -r '.[] | select(.title | startswith("[Verify]:")) | "\(.number)|\(.title)"' \
-    | while IFS='|' read -r num title; do
+  gh issue list --repo "$MARKET_REPO" --state open \
+    --search "$REPO_URL in:body" --json number,title,body --limit 100 2>/dev/null \
+    | jq -r '.[]
+        | select(.title | startswith("[Verify]:"))
+        | "\(.number)\t\(.body)"' \
+    | while IFS=$'\t' read -r num body; do
         local sha
-        sha=$(gh issue view "$num" --repo "$MARKET_REPO" --json body --jq .body \
-          | awk '/^### Target commit$/{f=1;next} f&&NF{print;exit}')
-        [ -n "$sha" ] && echo "$num|$sha|open"
+        sha=$(awk '/^### Target commit$/{f=1;next} f&&NF{print;exit}' <<<"$body")
+        [ -n "$sha" ] && echo "$num|$sha"
       done
 }
 
 cmd_status() {
   require_repo
-  local ver head_sha main_sha tag_sha verify
+  local ver head_sha main_sha tag_sha verify rc=0
   ver=$(get_version)
   head_sha=$(git rev-parse HEAD)
   fetch_origin_main
@@ -224,25 +230,39 @@ cmd_status() {
   fi
   verify=$(find_verify_issue)
   if [ -n "$verify" ]; then
-    while IFS='|' read -r num sha _state; do
+    while IFS=$'\t' read -r num sha; do
       info "verify:      #$num pins $sha"
-      check_drift "$sha" || true
+      if [ "$sha" != "$main_sha" ]; then
+        info "DRIFT:       pending verification #$num is stale (origin/main moved)"
+        rc=1
+      fi
     done <<<"$verify"
   else
     info "verify:      no open [Verify] issue"
   fi
+  return "$rc"
 }
 
 cmd_bump() {
   require_repo
-  local new="$1"
-  if ! git checkout --quiet && git diff --quiet -- "$MANIFEST"; then :; fi
-  git diff --quiet -- "$MANIFEST" || die "$MANIFEST has uncommitted changes" "commit or stash first"
+  local new="$1" dry=0; [ "${2:-}" = "--dry-run" ] && dry=1
+  [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+    die "Invalid version: $new (expected semver like 1.2.3)" "$SCRIPT_NAME bump <version>  e.g. $SCRIPT_NAME bump 1.1.0"
+  git diff --quiet HEAD -- "$MANIFEST" || die "$MANIFEST has uncommitted changes" "commit or stash first"
   local old
   old=$(get_version)
   [ "$new" != "$old" ] || { info "already $old — nothing to do"; exit 0; }
+  if [ "$dry" = 1 ]; then
+    info "[dry-run] $MANIFEST version: $old -> $new (no changes written)"
+    exit 0
+  fi
+  local tmp
   tmp=$(mktemp)
-  jq --arg v "$new" '.version = $v' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+  trap 'rm -f "$tmp"' EXIT
+  jq -c --arg v "$new" '.version = $v' "$MANIFEST" > "$tmp"
+  chmod 644 "$tmp"
+  mv "$tmp" "$MANIFEST"
+  trap - EXIT
   info "bumped $MANIFEST: $old -> $new"
   info "next: commit this on the feature branch, then merge to main"
 }
@@ -255,12 +275,23 @@ cmd_tag() {
   tag="$TAG_PREFIX$ver"
   assert_on_main
   assert_main_synced
+  check_pending_verify_drift
   head_sha=$(git rev-parse HEAD)
   local existing
   existing=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null || echo "")
   if [ -n "$existing" ]; then
     if [ "$existing" = "$head_sha" ]; then
-      info "tag $tag already at HEAD ($head_sha) — nothing to do"
+      if git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
+        info "tag $tag already at HEAD ($head_sha) and pushed — nothing to do"
+      else
+        info "tag $tag exists locally at HEAD but is not pushed"
+        if [ "$dry" = 1 ]; then
+          info "[dry-run] git push origin $tag"
+        else
+          git push origin "$tag"
+          info "pushed $tag"
+        fi
+      fi
     else
       die "tag $tag exists at $existing, but HEAD is $head_sha" \
         "bump the version for a new tag; never move an existing one"
@@ -287,6 +318,7 @@ cmd_publish() {
   name=$(jq -r .name "$MANIFEST")
   assert_on_main
   assert_main_synced
+  check_pending_verify_drift
   head_sha=$(git rev-parse HEAD)
   local tagged
   tagged=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null || echo "")
@@ -299,16 +331,16 @@ cmd_publish() {
     info "release $tag already exists — skipping release creation"
   else
     if [ "$dry" = 1 ]; then
-      info "[dry-run] gh release create $tag --generate-notes --verify-tag"
+      info "[dry-run] gh release create $tag --generate-notes --verify-tag --repo ${REPO_URL#https://github.com/}"
     else
-      gh release create "$tag" --generate-notes --verify-tag >/dev/null
+      gh release create "$tag" --generate-notes --verify-tag --repo "${REPO_URL#https://github.com/}" >/dev/null
       info "created release $tag"
     fi
   fi
 
   # Idempotency: verify issue for this exact SHA
-  local existing_issue=""
-  while IFS='|' read -r num sha _state; do
+  local existing_issue="" num sha
+  while IFS=$'\t' read -r num sha; do
     if [ "$sha" = "$head_sha" ]; then existing_issue="$num"; fi
   done < <(find_verify_issue)
   if [ -n "$existing_issue" ]; then
@@ -317,7 +349,9 @@ cmd_publish() {
     exit 0
   fi
 
+  local bodyf
   bodyf=$(mktemp)
+  trap 'rm -f "$bodyf"' EXIT
   verify_issue_fields "$head_sha" > "$bodyf"
   title="[Verify]: $name $ver"
   if [ "$dry" = 1 ]; then
@@ -328,7 +362,6 @@ cmd_publish() {
   else
     local url
     url=$(gh issue create --repo "$MARKET_REPO" --title "$title" --body-file "$bodyf")
-    rm -f "$bodyf"
     info "opened $url"
     info "next: FREEZE main until approved; poll with $SCRIPT_NAME wait <issue-number>"
   fi
@@ -338,8 +371,12 @@ cmd_revalidate() {
   require_repo
   local issue="$1" dry=0; [ "${2:-}" = "--dry-run" ] && dry=1
   local repo_full="${REPO_URL#https://github.com/}"
-  local body marker
+  local body marker state
   marker="### Revalidation request"
+  state=$(gh issue view "$issue" --repo "$MARKET_REPO" --json state --jq .state) \
+    || die "Cannot read issue #$issue in $MARKET_REPO" "check the issue number"
+  [ "$state" = "OPEN" ] || die "issue #$issue is $state — editing a closed issue triggers no validation" \
+    "open a fresh [Verify] issue instead: $SCRIPT_NAME publish"
   body=$(gh issue view "$issue" --repo "$MARKET_REPO" --json body --jq .body)
   local head_sha
   fetch_origin_main
@@ -382,7 +419,7 @@ cmd_wait() {
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local bodies hits
     bodies=$(gh issue view "$issue" --repo "$MARKET_REPO" --json comments,labels \
-      --jq '.comments[] | select(.author.login=="github-actions") | .body' 2>/dev/null)
+      --jq '.comments[] | select(.author.login=="github-actions" or .author.login=="github-actions[bot]") | .body' 2>/dev/null)
     # Bot comments cite abbreviated SHAs in prose; count distinct bot comments pinning our HEAD.
     hits=$(grep -cE "${expected:0:7}(${expected:7:33})?" <<<"$bodies" || true)
     local labels

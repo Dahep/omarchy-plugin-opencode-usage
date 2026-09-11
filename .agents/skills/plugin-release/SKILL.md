@@ -52,23 +52,24 @@ Rules baked into this ordering:
 a completed step is a no-op).
 
 ```bash
-./release status                # show manifest version, HEAD, origin/main, tag/verify-issue state, drift check
-./release bump <version>        # patch manifest.json version (use on feature branch, pre-merge)
+./release status                # show manifest version, HEAD, origin/main, tag/verify-issue state; exits non-zero on drift
+./release bump <version> [--dry-run]
+                                # patch manifest.json version (semver, use on feature branch, pre-merge)
 ./release tag [--dry-run]       # on main: tag v<version> at HEAD, push the tag
 ./release publish [--dry-run]   # gh release create + open [Verify] issue with full 40-char HEAD SHA
 ./release revalidate <issue> [--dry-run]
-                                # real-content edit to an existing issue to retrigger validation
+                                # real-content edit to an OPEN issue to retrigger validation
 ./release wait <issue>          # poll bot comments until validation + baseline pin the expected SHA
 ```
 
 ## Drift protection
 
 The whole session that motivated this workflow was lost to a stale baseline
-SHA. `status`, `tag`, and `publish` compare `git rev-parse origin/main`
-against the SHA cited in any open `[Verify]` issue and exit non-zero on
-mismatch with a loud warning. If drift happens: open a fresh `[Verify]` issue
-for the new HEAD (or `revalidate` the open one) — never let a maintainer
-approve against a stale SHA.
+SHA. `status` reports drift (exits non-zero); `tag` and `publish` refuse to
+run while an open `[Verify]` issue pins a SHA other than `origin/main` —
+moving `main` while an update is pending makes its baseline stale. If drift
+happens: `revalidate` the open issue or open a fresh `[Verify]` issue for the
+new HEAD — never let a maintainer approve against a stale SHA.
 
 **The freeze itself cannot be enforced locally** — treat it as a checklist:
 after `publish`, no direct pushes to `main` until the issue shows
