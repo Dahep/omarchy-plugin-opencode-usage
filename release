@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# release — agent-friendly release CLI for this omarchy plugin.
+#
+# Resource:  manifest.json  (version), git (main/origin), gh (releases, issues)
+# Marketplace repo: omacom/omarchy-plugin-marketplace (exact-commit verification)
+set -euo pipefail
+
+REPO_URL="https://github.com/Dahep/omarchy-plugin-opencode-usage"
+MARKET_REPO="omacom/omarchy-plugin-marketplace"
+MANIFEST="manifest.json"
+SCRIPT_NAME="release"
+TAG_PREFIX="v"
+
+usage() {
+  cat <<EOF
+Release CLI for the omarchy-plugin marketplace flow.
+
+Usage:
+  $SCRIPT_NAME <command> [args] [--dry-run]
+
+Commands:
+  status                    Show version, HEAD, origin/main, tag/verify state, drift check
+  bump <version>            Set manifest.json version (feature branch, before merge)
+  tag [--dry-run]           On main: tag v<version> at HEAD and push the tag
+  publish [--dry-run]       Create GitHub release + open [Verify] issue with full HEAD SHA
+  revalidate <issue> [--dry-run]
+                            Real-content edit on an existing issue to retrigger validation
+  wait <issue>              Poll bot comments until they pin the current expected SHA
+  help [command]            Show this help, or help for one command
+
+Examples:
+  $SCRIPT_NAME status
+  $SCRIPT_NAME bump 1.1.0
+  $SCRIPT_NAME tag --dry-run
+  $SCRIPT_NAME tag
+  $SCRIPT_NAME publish --dry-run
+  $SCRIPT_NAME publish
+  $SCRIPT_NAME revalidate 6119
+  $SCRIPT_NAME wait 6123
+
+Typical flow:
+  1. On the feature branch:  $SCRIPT_NAME bump <version>   (then commit + merge)
+  2. On main after merge:    $SCRIPT_NAME tag && $SCRIPT_NAME publish
+  3. Freeze main until the marketplace maintainer approves the [Verify] issue.
+EOF
+}
+
+cmd_help() {
+  case "${1:-}" in
+    "") usage ;;
+    status|bump|tag|publish|revalidate|wait) "help_$1" ;;
+    *) die "Unknown help topic: $1" "$SCRIPT_NAME help" ;;
+  esac
+}
+help_status() { cat <<'EOF'
+status — show release state (read-only)
+
+Prints manifest version, local HEAD, origin/main, whether the version tag
+exists, open [Verify] issues, and whether origin/main has drifted from any
+pending verification SHA.
+
+Examples:
+  release status
+EOF
+}
+help_bump() { cat <<'EOF'
+bump <version> — set manifest.json version
+
+Run on the feature branch BEFORE merging; the marketplace binds the manifest
+version to the exact verified commit.
+
+Examples:
+  release bump 1.1.0
+EOF
+}
+help_tag() { cat <<'EOF'
+tag [--dry-run] — tag the merge commit on main
+
+Asserts you are on main and origin/main is fetched and current. Creates
+v<manifest-version> at HEAD and pushes it. Idempotent: an existing tag at
+HEAD is a no-op; a tag at a different commit is an error.
+
+Examples:
+  release tag --dry-run
+  release tag
+EOF
+}
+help_publish() { cat <<'EOF'
+publish [--dry-run] — GitHub release + [Verify] issue
+
+Creates a GitHub release for the version tag and opens a
+"[Verify]: <name> <version>" issue on omacom/omarchy-plugin-marketplace with
+the full 40-char HEAD SHA. Idempotent: skips steps already done. Refuses if
+the tag is missing or HEAD is not the tagged commit.
+
+Examples:
+  release publish --dry-run
+  release publish
+EOF
+}
+help_revalidate() { cat <<'EOF'
+revalidate <issue> [--dry-run] — retrigger marketplace validation
+
+GitHub fires no `edited` event for identical content. This appends/refreshes
+a revalidation note (real content delta) to the issue body so the
+marketplace re-runs validation at the current HEAD. Use for unblocking a
+stale baseline; for new releases use `publish` (a fresh [Verify] issue).
+
+Examples:
+  release revalidate 6119 --dry-run
+  release revalidate 6119
+EOF
+}
+help_wait() { cat <<'EOF'
+wait <issue> — poll until bot reports pin the expected SHA
+
+Waits (up to 15 min) for both the marketplace-validation and security-baseline
+bot comments on the issue to cite the expected full SHA, then prints their
+state. Checks bot comments, not the workflow-run list.
+
+Examples:
+  release wait 6123
+EOF
+}
+
+die() { echo "Error: $1" >&2; [ -n "${2:-}" ] && echo "  $2" >&2; exit 1; }
+info() { echo "$@"; }
+
+require_repo() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || die "Not inside the plugin repo" "cd $(dirname "$(readlink -f "$0")")"
+  command -v gh >/dev/null || die "gh CLI not found" "install gh and run: gh auth login"
+  command -v jq >/dev/null || die "jq not found" "install jq"
+}
+
+get_version() {
+  jq -r .version "$MANIFEST" 2>/dev/null || die "Cannot read version from $MANIFEST" "run from the repo root: $SCRIPT_NAME status"
+}
+
+fetch_origin_main() {
+  git fetch origin main --quiet 2>/dev/null || true
+}
+
+assert_on_main() {
+  local branch
+  branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+  [ "$branch" = "main" ] || die "Not on main (on: ${branch:-detached HEAD})" \
+    "$SCRIPT_NAME tag/publish run after merging: git checkout main && git pull"
+}
+
+assert_main_synced() {
+  local local_main remote_main
+  fetch_origin_main
+  local_main=$(git rev-parse HEAD)
+  remote_main=$(git rev-parse origin/main)
+  [ "$local_main" = "$remote_main" ] || die "Local main ($local_main) != origin/main ($remote_main)" \
+    "git pull --ff-only, then re-run"
+}
+
+check_drift() {
+  # Warn (non-fatal for status) if origin/main moved past a pending verify SHA.
+  local expected="$1" current
+  fetch_origin_main
+  current=$(git rev-parse origin/main)
+  if [ "$expected" != "$current" ]; then
+    echo "WARNING: verification SHA $expected != origin/main HEAD $current — baseline is stale." >&2
+    echo "  Open a fresh [Verify] issue for the new HEAD: $SCRIPT_NAME publish" >&2
+    echo "  or revalidate the open issue: $SCRIPT_NAME revalidate <issue>" >&2
+    return 1
+  fi
+}
+
+verify_issue_fields() {
+  echo "### Verification action"
+  echo ""
+  echo "Verify and publish a newer upstream commit"
+  echo ""
+  echo "### Plugin ID"
+  echo ""
+  jq -r .id "$MANIFEST"
+  echo ""
+  echo "### Repository URL"
+  echo ""
+  echo "$REPO_URL"
+  echo ""
+  echo "### Target commit"
+  echo ""
+  echo "$1"
+  echo ""
+  echo "### Verification acknowledgment"
+  echo ""
+  echo "- [x] I understand that only the exact target commit can become a verified marketplace snapshot and that verification is not a security audit."
+}
+
+# Find the open [Verify] issue for this repo, if any. Echoes "issue|sha|state".
+find_verify_issue() {
+  gh issue list --repo "$MARKET_REPO" --search "in:title \"[Verify]:\" state:open author:@me" \
+    --json number,title,state --limit 20 2>/dev/null \
+    | jq -r '.[] | select(.title | startswith("[Verify]:")) | "\(.number)|\(.title)"' \
+    | while IFS='|' read -r num title; do
+        local sha
+        sha=$(gh issue view "$num" --repo "$MARKET_REPO" --json body --jq .body \
+          | awk '/^### Target commit$/{f=1;next} f&&NF{print;exit}')
+        [ -n "$sha" ] && echo "$num|$sha|open"
+      done
+}
+
+cmd_status() {
+  require_repo
+  local ver head_sha main_sha tag_sha verify
+  ver=$(get_version)
+  head_sha=$(git rev-parse HEAD)
+  fetch_origin_main
+  main_sha=$(git rev-parse origin/main)
+  info "version:     $ver"
+  info "HEAD:        $head_sha ($(git symbolic-ref --short HEAD 2>/dev/null || echo detached))"
+  info "origin/main: $main_sha"
+  tag_sha=$(git rev-parse -q --verify "refs/tags/$TAG_PREFIX$ver^{commit}" 2>/dev/null || echo "")
+  if [ -z "$tag_sha" ]; then
+    info "tag:         $TAG_PREFIX$ver not created"
+  elif [ "$tag_sha" = "$head_sha" ]; then
+    info "tag:         $TAG_PREFIX$ver at HEAD"
+  else
+    info "tag:         $TAG_PREFIX$ver at $tag_sha (differs from HEAD)"
+  fi
+  verify=$(find_verify_issue)
+  if [ -n "$verify" ]; then
+    while IFS='|' read -r num sha _state; do
+      info "verify:      #$num pins $sha"
+      check_drift "$sha" || true
+    done <<<"$verify"
+  else
+    info "verify:      no open [Verify] issue"
+  fi
+}
+
+cmd_bump() {
+  require_repo
+  local new="$1"
+  if ! git checkout --quiet && git diff --quiet -- "$MANIFEST"; then :; fi
+  git diff --quiet -- "$MANIFEST" || die "$MANIFEST has uncommitted changes" "commit or stash first"
+  local old
+  old=$(get_version)
+  [ "$new" != "$old" ] || { info "already $old — nothing to do"; exit 0; }
+  tmp=$(mktemp)
+  jq --arg v "$new" '.version = $v' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+  info "bumped $MANIFEST: $old -> $new"
+  info "next: commit this on the feature branch, then merge to main"
+}
+
+cmd_tag() {
+  require_repo
+  local dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+  local ver tag head_sha
+  ver=$(get_version)
+  tag="$TAG_PREFIX$ver"
+  assert_on_main
+  assert_main_synced
+  head_sha=$(git rev-parse HEAD)
+  local existing
+  existing=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null || echo "")
+  if [ -n "$existing" ]; then
+    if [ "$existing" = "$head_sha" ]; then
+      info "tag $tag already at HEAD ($head_sha) — nothing to do"
+    else
+      die "tag $tag exists at $existing, but HEAD is $head_sha" \
+        "bump the version for a new tag; never move an existing one"
+    fi
+    exit 0
+  fi
+  if [ "$dry" = 1 ]; then
+    info "[dry-run] git tag -a $tag -m \"$ver\" $head_sha"
+    info "[dry-run] git push origin $tag"
+    exit 0
+  fi
+  git tag -a "$tag" -m "$ver" "$head_sha"
+  git push origin "$tag"
+  info "tagged $tag at $head_sha and pushed"
+  info "next: $SCRIPT_NAME publish"
+}
+
+cmd_publish() {
+  require_repo
+  local dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+  local ver tag name head_sha bodyf title
+  ver=$(get_version)
+  tag="$TAG_PREFIX$ver"
+  name=$(jq -r .name "$MANIFEST")
+  assert_on_main
+  assert_main_synced
+  head_sha=$(git rev-parse HEAD)
+  local tagged
+  tagged=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null || echo "")
+  [ -n "$tagged" ] || die "tag $tag does not exist" "$SCRIPT_NAME tag && $SCRIPT_NAME publish"
+  [ "$tagged" = "$head_sha" ] || die "tag $tag points at $tagged, HEAD is $head_sha" \
+    "the release must point at the verified commit"
+
+  # Idempotency: release
+  if gh release view "$tag" --repo "${REPO_URL#https://github.com/}" >/dev/null 2>&1; then
+    info "release $tag already exists — skipping release creation"
+  else
+    if [ "$dry" = 1 ]; then
+      info "[dry-run] gh release create $tag --generate-notes --verify-tag"
+    else
+      gh release create "$tag" --generate-notes --verify-tag >/dev/null
+      info "created release $tag"
+    fi
+  fi
+
+  # Idempotency: verify issue for this exact SHA
+  local existing_issue=""
+  while IFS='|' read -r num sha _state; do
+    if [ "$sha" = "$head_sha" ]; then existing_issue="$num"; fi
+  done < <(find_verify_issue)
+  if [ -n "$existing_issue" ]; then
+    info "[Verify] issue #$existing_issue already pins $head_sha — skipping issue creation"
+    info "next: $SCRIPT_NAME wait $existing_issue"
+    exit 0
+  fi
+
+  bodyf=$(mktemp)
+  verify_issue_fields "$head_sha" > "$bodyf"
+  title="[Verify]: $name $ver"
+  if [ "$dry" = 1 ]; then
+    info "[dry-run] gh issue create --repo $MARKET_REPO --title \"$title\" --body-file <verify-issue-body>"
+    echo "--- issue body ---"
+    cat "$bodyf"
+    echo "--- end body ---"
+  else
+    local url
+    url=$(gh issue create --repo "$MARKET_REPO" --title "$title" --body-file "$bodyf")
+    rm -f "$bodyf"
+    info "opened $url"
+    info "next: FREEZE main until approved; poll with $SCRIPT_NAME wait <issue-number>"
+  fi
+}
+
+cmd_revalidate() {
+  require_repo
+  local issue="$1" dry=0; [ "${2:-}" = "--dry-run" ] && dry=1
+  local repo_full="${REPO_URL#https://github.com/}"
+  local body marker
+  marker="### Revalidation request"
+  body=$(gh issue view "$issue" --repo "$MARKET_REPO" --json body --jq .body)
+  local head_sha
+  fetch_origin_main
+  head_sha=$(git rev-parse origin/main)
+  # Idempotency: already requested for this exact SHA?
+  if grep -qF "$head_sha" <<<"$body" && grep -qF "$marker" <<<"$body"; then
+    info "issue #$issue already has a revalidation note for $head_sha — nothing to do"
+    exit 0
+  fi
+  # Replace any previous revalidation section (keeps the body bounded), else append.
+  local newbody
+  if grep -qF "$marker" <<<"$body"; then
+    newbody=$(awk -v m="$marker" 'index($0,m)==1{skip=1} !skip{print}' <<<"$body")
+  else
+    newbody="$body"
+  fi
+  newbody+="$marker
+
+HEAD moved to $head_sha (repo: $repo_full). Requesting fresh validation/security-baseline results for this commit.
+"
+  if [ "$dry" = 1 ]; then
+    info "[dry-run] gh api -X PATCH repos/$MARKET_REPO/issues/$issue -f body=<diff below>"
+    echo "--- body diff ---"
+    diff <(printf '%s' "$body") <(printf '%s' "$newbody") || true
+    echo "--- end diff ---"
+  else
+    gh api -X PATCH "repos/$MARKET_REPO/issues/$issue" -f body="$newbody" --jq .updated_at >/dev/null
+    info "issue #$issue edited with new content at $(date -u +%H:%M:%SZ)"
+    info "next: $SCRIPT_NAME wait $issue"
+  fi
+}
+
+cmd_wait() {
+  require_repo
+  local issue="$1"
+  fetch_origin_main
+  local expected
+  expected=$(git rev-parse origin/main)
+  local deadline=$(( $(date +%s) + 900 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local bodies hits
+    bodies=$(gh issue view "$issue" --repo "$MARKET_REPO" --json comments,labels \
+      --jq '.comments[] | select(.author.login=="github-actions") | .body' 2>/dev/null)
+    # Bot comments cite abbreviated SHAs in prose; count distinct bot comments pinning our HEAD.
+    hits=$(grep -cE "${expected:0:7}(${expected:7:33})?" <<<"$bodies" || true)
+    local labels
+    labels=$(gh issue view "$issue" --repo "$MARKET_REPO" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null)
+    if [ "${hits:-0}" -ge 2 ]; then
+      info "done: both bot reports pin $expected (labels: ${labels:-none})"
+      exit 0
+    fi
+    info "waiting: $hits/2 bot reports pin $expected (labels: ${labels:-none})"
+    sleep 45
+  done
+  die "timed out after 15 min waiting for bot reports at $expected" \
+    "check issue comments and marketplace workflow runs, then re-run: $SCRIPT_NAME wait $issue"
+}
+
+main() {
+  [ $# -ge 1 ] || { usage >&2; exit 1; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    status)    cmd_status "$@" ;;
+    bump)      [ $# -ge 1 ] || die "No version specified." "$SCRIPT_NAME bump <version>  e.g. $SCRIPT_NAME bump 1.1.0"; cmd_bump "$@" ;;
+    tag)       cmd_tag "$@" ;;
+    publish)   cmd_publish "$@" ;;
+    revalidate)[ $# -ge 1 ] || die "No issue specified." "$SCRIPT_NAME revalidate <issue-number>  e.g. $SCRIPT_NAME revalidate 6119"; cmd_revalidate "$@" ;;
+    wait)      [ $# -ge 1 ] || die "No issue specified." "$SCRIPT_NAME wait <issue-number>  e.g. $SCRIPT_NAME wait 6119"; cmd_wait "$@" ;;
+    help|--help|-h) cmd_help "${1:-}" ;;
+    *) die "Unknown command: $cmd" "$SCRIPT_NAME help" ;;
+  esac
+}
+
+main "$@"
